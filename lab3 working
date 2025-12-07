@@ -1,0 +1,1406 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ME416 – LIMO Real-Time Multi-Robot Planner (Lab 3)
+
+PHASE 1:
+    Physical (or single simulated) LIMO robot with real-time replanning.
+    - A* planner runs in a separate thread
+    - Uses MoCap (MQTT) for own pose
+    - Tracks OTHER robots via MoCap topics and Kalman filters
+    - Predicts their near-future positions and inflates keep-out zones
+    - Pure Pursuit + final goal approach follows the current path smoothly
+
+PHASE 2:
+    Multi-robot simulator with 12 “digital twins”.
+    - 12 robots share the same control logic as the physical robot
+    - Each has a random start and random goal inside the arena
+    - Each uses its own Async A* replanner with dynamic obstacles
+    - Robots treat other robots as moving obstacles using predicted motion
+    - Reverse + escape behavior reduces deadlock
+
+IMPORTANT FOR THIS LAB:
+    - Goals themselves are NOT obstacles.
+      Static obstacles = only arena walls.
+      A robot’s body is an obstacle for others.
+    - Robots are clamped to stay strictly inside the floor area at all times.
+
+AUTHOR: Ada, Andy, and Adithi (extended for Lab 3)
+COURSE: ME416
+"""
+
+import math
+import numpy as np
+import json
+import random
+import time
+import socket
+import threading
+
+# --- FORCE MATPLOTLIB BACKEND BEFORE IMPORTING PYLPLOT ---
+import matplotlib
+matplotlib.use('QtAgg')
+import matplotlib.pyplot as plt
+
+import paho.mqtt.client as mqtt
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+class Config:
+    """Configuration parameters for LIMO path planning and control"""
+
+    # --- LIMO / Network Configuration ---
+    LIMO_NUMBER = '809'      # change based on which limo is used
+    LIMO_IP_LAST_3 = '172'   # change based on which limo is used
+    LIMO_IP_PREFIX = '192.168.1.'
+    LIMO_PORT = 12345
+    MQTT_BROKER = 'rasticvm.lan'  # Hostname or IP of MQTT broker
+
+    # All possible robot IDs for Mocap / MQTT (for tracking others)
+    ROBOT_IDS = [str(i) for i in range(1, 13)]
+
+    # --- MoCap origin transformation (from calibration code) ---
+    MOCAP_ORIGIN_X = -4.5
+    MOCAP_ORIGIN_Y = 2.7
+
+    # --- Arena bounds (meters, map frame) ---
+    ARENA_X_MIN = 0.0
+    ARENA_X_MAX = 6.0
+    ARENA_Y_MIN = 0.0
+    ARENA_Y_MAX = 4.5
+
+    # --- Pure Pursuit Controller Parameters ---
+    LOOKAHEAD_DISTANCE = 0.3  # [m]
+    V_DESIRED = 0.25          # [m/s]
+    MIN_TURNING_RADIUS = 0.25  # [m]
+
+    # --- Loop Recovery Parameters (Phase 1, single robot) ---
+    LOOP_RECOVERY_DURATION = 1.0
+    LOOPS_BEFORE_RECOVERY = 2
+
+    # --- Goal tolerance ---
+    GOAL_POSITION_TOL = 0.20
+    GOAL_HEADING_TOL = math.radians(25)
+
+    # --- Safety (velocity limits, total runtime) ---
+    MAX_LINEAR_VEL = 0.2
+    MAX_ANGULAR_VEL = math.radians(60)
+    MAX_TIME = 360  # [s]
+
+    # --- Control loop timing ---
+    CONTROL_RATE = 20
+    dt = 1 / CONTROL_RATE
+
+    # --- A* Planning parameters ---
+    GRID_SIZE = 0.5  # [m]
+    ROBOT_RADIUS = 0.3  # [m]
+
+    # --- Real-time replanning / multi-robot ---
+    # --- Real-time replanning / multi-robot ---
+    REPLAN_INTERVAL = 1.0        # [s] between replans
+    PREDICTION_HORIZON = 2.0     # [s] lookahead for dynamic obstacles
+    BASE_SAFETY_RADIUS = 0.6     # Changed from 0.5 to 0.6m (bigger buffer)
+    VELOCITY_SCALE_FACTOR = 0.3  # Changed from 0.2 to 0.3 (more spacing)
+
+    # --- DEADLOCK / STUCK HANDLING (Phase 2 sim) ---
+    STUCK_TIME_THRESHOLD = 3.0       # [s] no progress -> stuck
+    ESCAPE_DURATION = 2.0            # [s] in escape mode
+    ESCAPE_REVERSE_SPEED = 0.20      # [m/s] reverse speed
+    ESCAPE_TURN_RATE = math.radians(40)  # [rad/s]
+# --- PROXIMITY REVERSE (immediate response) ---
+    # --- PROXIMITY REVERSE (immediate response) ---
+    PROXIMITY_THRESHOLD = 0.8        # Changed from 0.6 to 0.8m (detect earlier)
+    PROXIMITY_REVERSE_DISTANCE = 0.15  # Changed from 0.10 to 0.15m (reverse more)
+    PROXIMITY_REVERSE_SPEED = 0.20   # Changed from 0.15 to 0.20m/s (faster escape)
+# =============================================================================
+# BASIC UTILITIES
+# =============================================================================
+
+def wrap_to_pi(angle):
+    """Wrap angle to [-pi, pi]."""
+    return (angle + math.pi) % (2 * math.pi) - math.pi
+
+
+def quaternion_to_yaw(qx, qy, qz, qw):
+    """
+    Convert quaternion to yaw angle (rotation around Z-axis).
+    """
+    siny_cosp = 2.0 * (qw * qz + qx * qy)
+    cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def sample_random_pose(cfg: Config):
+    """
+    Sample a random (x, y, theta) inside the arena with a margin from walls.
+    """
+    margin = 0.3
+    x = random.uniform(cfg.ARENA_X_MIN + margin, cfg.ARENA_X_MAX - margin)
+    y = random.uniform(cfg.ARENA_Y_MIN + margin, cfg.ARENA_Y_MAX - margin)
+    theta = random.uniform(-math.pi, math.pi)
+    return x, y, theta
+
+
+def sample_random_goal(cfg: Config):
+    """
+    Sample a random goal (x, y) inside the arena.
+    Goals are *not* obstacles; they are just target points.
+    """
+    margin = 0.3
+    x = random.uniform(cfg.ARENA_X_MIN + margin, cfg.ARENA_X_MAX - margin)
+    y = random.uniform(cfg.ARENA_Y_MIN + margin, cfg.ARENA_Y_MAX - margin)
+    return np.array([x, y])
+
+
+# =============================================================================
+# A* PLANNER
+# =============================================================================
+
+class AStarPlanner:
+    """A* grid-based path planner."""
+
+    def __init__(self, ox, oy, resolution, rr):
+        """
+        Initialize grid map for A* planning.
+
+        ox: x position list of Obstacles [m]
+        oy: y position list of Obstacles [m]
+        resolution: grid resolution [m]
+        rr: robot radius [m]
+        """
+        self.resolution = resolution
+        self.rr = rr
+        self.min_x, self.min_y = 0, 0
+        self.max_x, self.max_y = 0, 0
+        self.obstacle_map = None
+        self.x_width, self.y_width = 0, 0
+        self.motion = self.get_motion_model()
+        self.calc_obstacle_map(ox, oy)
+
+    class Node:
+        def __init__(self, x, y, cost, parent_index):
+            self.x = x
+            self.y = y
+            self.cost = cost
+            self.parent_index = parent_index
+
+        def __str__(self):
+            return f"{self.x},{self.y},{self.cost},{self.parent_index}"
+
+    def planning(self, sx, sy, gx, gy):
+        """
+        A* path search.
+
+        sx, sy: start (m)
+        gx, gy: goal (m)
+
+        Returns:
+            rx, ry: lists of x, y in meters along the final path.
+        """
+        start_node = self.Node(self.calc_xy_index(sx, self.min_x),
+                               self.calc_xy_index(sy, self.min_y), 0.0, -1)
+        goal_node = self.Node(self.calc_xy_index(gx, self.min_x),
+                              self.calc_xy_index(gy, self.min_y), 0.0, -1)
+
+        open_set, closed_set = dict(), dict()
+        open_set[self.calc_grid_index(start_node)] = start_node
+
+        while True:
+            if len(open_set) == 0:
+                print("A*: open set empty, no path found.")
+                return None, None
+
+            # pick node with minimum f = g + h
+            c_id = min(
+                open_set,
+                key=lambda o: open_set[o].cost +
+                              self.calc_heuristic(goal_node, open_set[o])
+            )
+            current = open_set[c_id]
+
+            # reached goal
+            if current.x == goal_node.x and current.y == goal_node.y:
+                goal_node.parent_index = current.parent_index
+                goal_node.cost = current.cost
+                break
+
+            # move current from open to closed
+            del open_set[c_id]
+            closed_set[c_id] = current
+
+            # expand neighbors
+            for i, _ in enumerate(self.motion):
+                node = self.Node(current.x + self.motion[i][0],
+                                 current.y + self.motion[i][1],
+                                 current.cost + self.motion[i][2],
+                                 c_id)
+                n_id = self.calc_grid_index(node)
+
+                # check safety
+                if not self.verify_node(node):
+                    continue
+
+                if n_id in closed_set:
+                    continue
+
+                if n_id not in open_set:
+                    open_set[n_id] = node
+                else:
+                    if open_set[n_id].cost > node.cost:
+                        open_set[n_id] = node
+
+        rx, ry = self.calc_final_path(goal_node, closed_set)
+        return rx, ry
+
+    def calc_final_path(self, goal_node, closed_set):
+        rx, ry = [self.calc_grid_position(goal_node.x, self.min_x)], [
+            self.calc_grid_position(goal_node.y, self.min_y)]
+        parent_index = goal_node.parent_index
+        while parent_index != -1:
+            n = closed_set[parent_index]
+            rx.append(self.calc_grid_position(n.x, self.min_x))
+            ry.append(self.calc_grid_position(n.y, self.min_y))
+            parent_index = n.parent_index
+        return rx, ry
+
+    @staticmethod
+    def calc_heuristic(n1, n2):
+        w = 1.0
+        d = w * math.hypot(n1.x - n2.x, n1.y - n2.y)
+        return d
+
+    def calc_grid_position(self, index, min_position):
+        return index * self.resolution + min_position
+
+    def calc_xy_index(self, position, min_pos):
+        return round((position - min_pos) / self.resolution)
+
+    def calc_grid_index(self, node):
+        return (node.y - self.min_y) * self.x_width + (node.x - self.min_x)
+
+    def verify_node(self, node):
+        px = self.calc_grid_position(node.x, self.min_x)
+        py = self.calc_grid_position(node.y, self.min_y)
+
+        if px < self.min_x or py < self.min_y:
+            return False
+        if px >= self.max_x or py >= self.max_y:
+            return False
+
+        if self.obstacle_map[node.x][node.y]:
+            return False
+
+        return True
+
+    def calc_obstacle_map(self, ox, oy):
+        self.min_x = round(min(ox))
+        self.min_y = round(min(oy))
+        self.max_x = round(max(ox))
+        self.max_y = round(max(oy))
+
+        self.x_width = max(1, round((self.max_x - self.min_x) / self.resolution))
+        self.y_width = max(1, round((self.max_y - self.min_y) / self.resolution))
+
+        self.obstacle_map = [[False for _ in range(self.y_width)]
+                             for _ in range(self.x_width)]
+        for ix in range(self.x_width):
+            x = self.calc_grid_position(ix, self.min_x)
+            for iy in range(self.y_width):
+                y = self.calc_grid_position(iy, self.min_y)
+                for iox, ioy in zip(ox, oy):
+                    if math.hypot(iox - x, ioy - y) <= self.rr:
+                        self.obstacle_map[ix][iy] = True
+                        break
+
+    @staticmethod
+    def get_motion_model():
+        return [
+            [1, 0, 1],
+            [0, 1, 1],
+            [-1, 0, 1],
+            [0, -1, 1],
+            [-1, -1, math.sqrt(2)],
+            [-1, 1, math.sqrt(2)],
+            [1, -1, math.sqrt(2)],
+            [1, 1, math.sqrt(2)]
+        ]
+
+
+# =============================================================================
+# PATH STRUCTURE + PURE PURSUIT / GO-TO-GOAL
+# =============================================================================
+
+class Path:
+    """Path structure for Pure Pursuit."""
+
+    def __init__(self, x, y):
+        self.x = np.array(x)
+        self.y = np.array(y)
+        self.theta = np.zeros(len(x))
+
+        # arc length
+        self.s = np.zeros(len(x))
+        for i in range(1, len(x)):
+            dx = self.x[i] - self.x[i - 1]
+            dy = self.y[i] - self.y[i - 1]
+            self.s[i] = self.s[i - 1] + math.hypot(dx, dy)
+
+
+def find_lookahead_point(robot_x, robot_y, path, lookahead_distance):
+    distances = np.sqrt((path.x - robot_x) ** 2 + (path.y - robot_y) ** 2)
+    closest_idx = np.argmin(distances)
+
+    s_closest = path.s[closest_idx]
+    s_lookahead = s_closest + lookahead_distance
+
+    if s_lookahead > path.s[-1]:
+        lookahead_idx = len(path.x) - 1
+    else:
+        indices = np.where(path.s >= s_lookahead)[0]
+        lookahead_idx = indices[0] if len(indices) > 0 else len(path.x) - 1
+
+    return path.x[lookahead_idx], path.y[lookahead_idx], lookahead_idx
+
+
+def pure_pursuit_control(robot_pose, path, cfg: Config):
+    x, y, theta = robot_pose
+    lx, ly, _ = find_lookahead_point(x, y, path, cfg.LOOKAHEAD_DISTANCE)
+    dx = lx - x
+    dy = ly - y
+    alpha = math.atan2(dy, dx)
+    curvature = 2 * math.sin(wrap_to_pi(alpha - theta)) / cfg.LOOKAHEAD_DISTANCE
+    omega = curvature * cfg.V_DESIRED
+    omega = max(min(omega, cfg.MAX_ANGULAR_VEL), -cfg.MAX_ANGULAR_VEL)
+    v = min(cfg.V_DESIRED, cfg.MAX_LINEAR_VEL)
+    return v, omega, (lx, ly)
+
+
+def go_to_goal_control(x, y, theta, goal, cfg: Config):
+    """
+    Simple "go-to-goal" controller for final approach.
+    """
+    gx, gy = goal
+    dx = gx - x
+    dy = gy - y
+    dist = math.hypot(dx, dy)
+    desired_heading = math.atan2(dy, dx)
+    heading_error = wrap_to_pi(desired_heading - theta)
+
+    k_omega = 1.5
+    w = k_omega * heading_error
+    w = max(min(w, cfg.MAX_ANGULAR_VEL), -cfg.MAX_ANGULAR_VEL)
+
+    v_scale = max(0.0, math.cos(heading_error))
+    v = min(cfg.V_DESIRED, cfg.MAX_LINEAR_VEL) * v_scale
+
+    if dist < 0.15:  # creep in
+        v = min(v, 0.10)
+    return v, w
+
+
+# =============================================================================
+# MQTT DATA HOLDER FOR THIS ROBOT
+# =============================================================================
+
+class MQTTDataHolder:
+    """Handles asynchronous MQTT data in a background thread with JSON parsing."""
+
+    def __init__(self, limo_num, broker_address):
+        self.limo_num = limo_num
+        self.broker_address = broker_address
+        self.limo_topic = f"rb/limo{self.limo_num}"
+
+        self.latest_pos = None
+        self.latest_rot = None
+
+        self.data_lock = threading.Lock()
+        self.client = mqtt.Client()
+        self.client.on_connect = self.on_connect
+        self.client.on_message = self.on_message
+
+    def on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            print("✓ MQTT connected (self).")
+            self.client.subscribe(self.limo_topic)
+            print(f"  Subscribed to: {self.limo_topic}")
+        else:
+            print(f"✗ MQTT connection failed, code={rc}")
+
+    def on_message(self, client, userdata, msg):
+        try:
+            payload = msg.payload.decode('utf-8')
+            data = json.loads(payload)
+            with self.data_lock:
+                if 'pos' in data:
+                    self.latest_pos = data['pos']
+                if 'rot' in data:
+                    self.latest_rot = data['rot']
+        except Exception as e:
+            print(f"Error processing MQTT message: {e}")
+
+    def connect(self):
+        try:
+            self.client.connect(self.broker_address, 1883, 60)
+            self.client.loop_start()
+        except Exception as e:
+            print(f"✗ Could not connect to MQTT broker at {self.broker_address}: {e}")
+            raise
+
+    def stop(self):
+        self.client.loop_stop()
+        self.client.disconnect()
+        print("MQTT (self) disconnected.")
+
+    def get_pos(self):
+        with self.data_lock:
+            return self.latest_pos
+
+    def get_rot(self):
+        with self.data_lock:
+            return self.latest_rot
+
+
+def get_robot_pose_mqtt(mqtt_data: MQTTDataHolder, cfg: Config, prev_pose, dt):
+    """
+    Reads pose from MQTT JSON data, applies coordinate transform,
+    and calculates heading from velocity vector (or quaternion if needed).
+    """
+    pose = [0, 0, 0]
+    valid = False
+
+    try:
+        pos_data = mqtt_data.get_pos()
+        if pos_data is None or len(pos_data) < 3:
+            return pose, valid
+
+        mocap_x = pos_data[0]
+        mocap_y = pos_data[2]
+
+        x = mocap_x - cfg.MOCAP_ORIGIN_X
+        y = -(mocap_y - cfg.MOCAP_ORIGIN_Y)
+
+        if prev_pose is not None and dt > 1e-6:
+            dx = x - prev_pose[0]
+            dy = y - prev_pose[1]
+            speed = math.hypot(dx, dy) / dt
+            speed_threshold = 0.05
+            if speed > speed_threshold:
+                theta = math.atan2(dy, dx)
+            else:
+                theta = prev_pose[2]
+        else:
+            rot_data = mqtt_data.get_rot()
+            if rot_data and len(rot_data) >= 4:
+                theta = quaternion_to_yaw(rot_data[0], rot_data[1],
+                                          rot_data[2], rot_data[3])
+                theta = -theta
+            else:
+                theta = 0.0
+
+        pose = [x, y, theta]
+        valid = True
+        return pose, valid
+    except Exception as e:
+        print(f"Error parsing MoCap data: {e}")
+        return pose, False
+
+
+# =============================================================================
+# TCP CLIENT FOR REAL LIMO
+# =============================================================================
+
+class LimoTCP:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.sock = None
+
+    def connect(self):
+        ip = self.cfg.LIMO_IP_PREFIX + self.cfg.LIMO_IP_LAST_3
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.settimeout(2)
+        try:
+            self.sock.connect((ip, self.cfg.LIMO_PORT))
+            print(f"✓ Connected to LIMO at {ip}:{self.cfg.LIMO_PORT}")
+            return True
+        except Exception as e:
+            print(f"✗ LIMO TCP connection failed: {e}")
+            return False
+
+    def send_vel(self, v, w):
+        if self.sock is None:
+            return
+        try:
+            cmd = f"{v:.3f},{w:.3f}\n"
+            self.sock.send(cmd.encode())
+        except Exception:
+            pass
+
+    def stop(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+
+
+# =============================================================================
+# KALMAN FILTER + MULTI-ROBOT TRACKER (FOR OTHER ROBOTS, PHASE 1)
+# =============================================================================
+
+class RobotKalmanFilter:
+    def __init__(self, x0, y0):
+        # state: [x, y, vx, vy]
+        self.state = np.array([x0, y0, 0.0, 0.0])
+        self.P = np.eye(4)
+        self.Q = np.diag([0.1, 0.1, 0.5, 0.5])
+        self.R = np.diag([0.05, 0.05])
+        self.last_update_time = time.time()
+
+    def predict(self, dt):
+        F = np.array([
+            [1, 0, dt, 0],
+            [0, 1, 0, dt],
+            [0, 0,  1, 0],
+            [0, 0,  0, 1]
+        ])
+        self.state = F @ self.state
+        self.P = F @ self.P @ F.T + self.Q
+
+    def update(self, z):
+        now = time.time()
+        dt = now - self.last_update_time
+        if dt > 0:
+            self.predict(dt)
+
+        H = np.array([[1, 0, 0, 0],
+                      [0, 1, 0, 0]])
+        y = z - H @ self.state
+        S = H @ self.P @ H.T + self.R
+        K = self.P @ H.T @ np.linalg.inv(S)
+        self.state = self.state + K @ y
+        self.P = (np.eye(4) - K @ H) @ self.P
+        self.last_update_time = now
+
+    def get_predicted_position(self, t_ahead):
+        x = self.state[0] + self.state[2] * t_ahead
+        y = self.state[1] + self.state[3] * t_ahead
+        return x, y
+
+    def get_velocity_magnitude(self):
+        return math.hypot(self.state[2], self.state[3])
+
+
+class MultiRobotTracker:
+    """
+    Tracks OTHER robots via MQTT and maintains Kalman filters for each.
+    Used in Phase 1 (real robots).
+    """
+
+    def __init__(self, robot_ids, own_robot_id, broker_address, cfg: Config):
+        self.robot_ids = robot_ids
+        self.own_robot_id = own_robot_id
+        self.broker_address = broker_address
+        self.cfg = cfg
+
+        self.robot_filters = {}
+        self.data_lock = threading.Lock()
+        self.initialized_robots = set()
+
+        self.client = mqtt.Client()
+        self.client.on_connect = self.on_connect
+        self.client.on_message = self.on_message
+
+    def on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            print("✓ MQTT connected (other robots).")
+            for rid in self.robot_ids:
+                if rid == self.own_robot_id:
+                    continue
+                topic = f"rb/limo{rid}"
+                self.client.subscribe(topic)
+                print(f"  Subscribed to: {topic}")
+        else:
+            print(f"✗ MQTT (others) connection failed, code={rc}")
+
+    def on_message(self, client, userdata, msg):
+        try:
+            topic_parts = msg.topic.split('/')
+            if len(topic_parts) < 2:
+                return
+            robot_name = topic_parts[1]  # "limoX"
+            robot_id = robot_name.replace('limo', '')
+            data = json.loads(msg.payload.decode('utf-8'))
+            if 'pos' not in data:
+                return
+
+            x_mocap = data['pos'][0]
+            y_mocap = data['pos'][2]
+            x = x_mocap - self.cfg.MOCAP_ORIGIN_X
+            y = -(y_mocap - self.cfg.MOCAP_ORIGIN_Y)
+
+            with self.data_lock:
+                if robot_id not in self.initialized_robots:
+                    self.robot_filters[robot_id] = RobotKalmanFilter(x, y)
+                    self.initialized_robots.add(robot_id)
+                    print(f"  Initialized Kalman filter for robot {robot_id}")
+                else:
+                    self.robot_filters[robot_id].update(np.array([x, y]))
+        except Exception:
+            pass
+
+    def connect(self):
+        self.client.connect(self.broker_address, 1883, 60)
+        self.client.loop_start()
+
+    def stop(self):
+        self.client.loop_stop()
+        self.client.disconnect()
+        print("MultiRobotTracker disconnected.")
+
+    def get_predicted_obstacles(self, prediction_time):
+        """
+        Returns list of (x, y, radius) keepout disks for all tracked robots.
+        (Robots are obstacles; GOALS are not.)
+        """
+        obstacles = []
+        with self.data_lock:
+            for _, kf in self.robot_filters.items():
+                x, y = kf.get_predicted_position(prediction_time)
+                v = kf.get_velocity_magnitude()
+                r = self.cfg.BASE_SAFETY_RADIUS + v * self.cfg.VELOCITY_SCALE_FACTOR
+                obstacles.append((x, y, r))
+        return obstacles
+
+
+# =============================================================================
+# ASYNC PATH PLANNER (THREAD)
+# =============================================================================
+
+class AsyncPathPlanner:
+    """
+    Runs A* replanning in a separate thread.
+    Uses:
+        - static obstacles (walls, etc.)
+        - dynamic obstacles from a callback: get_predicted_obstacles(prediction_time)
+    """
+
+    def __init__(self, cfg: Config,
+                 static_ox, static_oy,
+                 goal,
+                 get_start_pose_fn,
+                 get_predicted_obstacles_fn):
+        self.cfg = cfg
+        self.static_ox = static_ox
+        self.static_oy = static_oy
+        self.goal = goal
+        self.get_start_pose_fn = get_start_pose_fn
+        self.get_predicted_obstacles_fn = get_predicted_obstacles_fn
+
+        self.current_path = None
+        self.path_lock = threading.Lock()
+        self.running = False
+        self.thread = None
+        self.last_plan_time = 0.0
+
+    def start(self, initial_path=None):
+        with self.path_lock:
+            self.current_path = initial_path
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+        print("✓ AsyncPathPlanner started")
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=2.0)
+
+    def get_path(self):
+        with self.path_lock:
+            return self.current_path
+
+    def _loop(self):
+        while self.running:
+            now = time.time()
+            if now - self.last_plan_time >= self.cfg.REPLAN_INTERVAL:
+                self._do_replan()
+                self.last_plan_time = now
+            time.sleep(0.05)
+
+    def _do_replan(self):
+        try:
+            start_pose = self.get_start_pose_fn()
+            if start_pose is None:
+                return
+            sx, sy = start_pose[0], start_pose[1]
+
+            dyn_obstacles = self.get_predicted_obstacles_fn(self.cfg.PREDICTION_HORIZON)
+
+            # NOTE: static obstacles are ONLY walls. Goals are NOT obstacles.
+            ox = list(self.static_ox)
+            oy = list(self.static_oy)
+            # approximate each dynamic obstacle disk as multiple points
+            for (cx, cy, rad) in dyn_obstacles:
+                for k in range(8):
+                    ang = 2 * math.pi * k / 8
+                    ox.append(cx + rad * math.cos(ang))
+                    oy.append(cy + rad * math.sin(ang))
+
+            if not ox or not oy:
+                return
+
+            a_star = AStarPlanner(ox, oy, self.cfg.GRID_SIZE, self.cfg.ROBOT_RADIUS)
+            rx, ry = a_star.planning(sx, sy, self.goal[0], self.goal[1])
+            if rx is None or len(rx) < 2:
+                return
+
+            new_path = Path(rx[::-1], ry[::-1])
+
+            if self._should_switch_path(new_path):
+                with self.path_lock:
+                    self.current_path = new_path
+                print(f"  [Replan] New path ({len(new_path.x)} waypoints)")
+        except Exception as e:
+            print(f"  [AsyncPathPlanner Error] {e}")
+
+    def _should_switch_path(self, new_path: Path):
+        with self.path_lock:
+            if self.current_path is None:
+                return True
+            old_path = self.current_path
+
+        min_len = min(len(old_path.x), len(new_path.x))
+        if min_len < 2:
+            return True
+
+        sample_indices = np.linspace(0, min_len - 1,
+                                     min(10, min_len), dtype=int)
+        total_dev = 0.0
+        for idx in sample_indices:
+            dx = old_path.x[idx] - new_path.x[idx]
+            dy = old_path.y[idx] - new_path.y[idx]
+            total_dev += math.hypot(dx, dy)
+        avg_dev = total_dev / len(sample_indices)
+        return avg_dev > 0.5  # PATH_SWITCH_THRESHOLD
+
+
+# =============================================================================
+# SIMULATION ROBOT (CLAMPED TO FLOOR)
+# =============================================================================
+
+class RobotSimulator:
+    """Simple kinematic robot simulator for testing (clamped to arena)."""
+
+    def __init__(self, x, y, theta, cfg: Config):
+        self.cfg = cfg
+        self.x = x
+        self.y = y
+        self.theta = theta
+        self.trajectory_x = [x]
+        self.trajectory_y = [y]
+
+    def update(self, v, omega, dt):
+        # integrate
+        self.theta += omega * dt
+        self.x += v * math.cos(self.theta) * dt
+        self.y += v * math.sin(self.theta) * dt
+
+        # CLAMP to arena floor so robot never leaves the area
+        margin = self.cfg.ROBOT_RADIUS + 1e-3
+        self.x = min(max(self.x,
+                         self.cfg.ARENA_X_MIN + margin),
+                     self.cfg.ARENA_X_MAX - margin)
+        self.y = min(max(self.y,
+                         self.cfg.ARENA_Y_MIN + margin),
+                     self.cfg.ARENA_Y_MAX - margin)
+
+        self.trajectory_x.append(self.x)
+        self.trajectory_y.append(self.y)
+
+    def get_pose(self):
+        return np.array([self.x, self.y, self.theta])
+
+
+# =============================================================================
+# OBSTACLES (BOUNDARIES ONLY)
+# =============================================================================
+
+def create_wall_obstacles(cfg: Config):
+    """
+    Create boundary obstacles along the arena edges using cfg.ARENA_*.
+    These are the ONLY static obstacles for A* (goals are NOT obstacles).
+    """
+    ox, oy = [], []
+    step = cfg.GRID_SIZE / 2.0  # finer than grid size for nicer walls
+
+    x_vals = np.arange(cfg.ARENA_X_MIN,
+                       cfg.ARENA_X_MAX + step * 0.5, step)
+    y_vals = np.arange(cfg.ARENA_Y_MIN,
+                       cfg.ARENA_Y_MAX + step * 0.5, step)
+
+    # bottom and top
+    for x in x_vals:
+        ox.append(x)
+        oy.append(cfg.ARENA_Y_MIN)
+        ox.append(x)
+        oy.append(cfg.ARENA_Y_MAX)
+
+    # left and right
+    for y in y_vals:
+        ox.append(cfg.ARENA_X_MIN)
+        oy.append(y)
+        ox.append(cfg.ARENA_X_MAX)
+        oy.append(y)
+
+    return ox, oy
+
+
+# =============================================================================
+# PHASE 1: REAL-TIME PLANNING FOR SINGLE ROBOT
+# =============================================================================
+
+def run_phase1_single_robot(simulation=True):
+    """
+    Phase 1:
+        Single robot (real or simulated) with:
+        - real-time A* replanning in separate thread
+        - other robots treated as dynamic obstacles via Kalman filters (real)
+        - Pure Pursuit + final approach
+        - Random goal inside arena, any final heading allowed
+    """
+    cfg = Config()
+    random.seed(0)
+    np.random.seed(0)
+
+    print("\n[Phase 1] Single robot with real-time replanning")
+    goal = sample_random_goal(cfg)
+    print(f"  Goal: ({goal[0]:.2f}, {goal[1]:.2f})")
+
+    wall_ox, wall_oy = create_wall_obstacles(cfg)
+
+    tcp = None
+    mqtt_self = None
+    tracker = None
+    robot_sim = None
+
+    try:
+        if simulation:
+            print("[Phase 1] Running in SIMULATION mode")
+            sx, sy, stheta = sample_random_pose(cfg)
+            robot_sim = RobotSimulator(sx, sy, stheta, cfg)
+            start_pose = np.array([sx, sy, stheta])
+        else:
+            print("[Phase 1] Running on REAL LIMO robot")
+            tcp = LimoTCP(cfg)
+            if not tcp.connect():
+                return
+            mqtt_self = MQTTDataHolder(cfg.LIMO_NUMBER, cfg.MQTT_BROKER)
+            mqtt_self.connect()
+            time.sleep(1.0)
+            print("Waiting for MoCap start pose...")
+            start_pose = None
+            for _ in range(100):
+                pose, valid = get_robot_pose_mqtt(mqtt_self, cfg, None, 0.0)
+                if valid:
+                    start_pose = np.array(pose)
+                    break
+                time.sleep(0.1)
+            if start_pose is None:
+                print("✗ Could not get start pose from MoCap.")
+                return
+
+        print(f"  Start pose: ({start_pose[0]:.2f}, {start_pose[1]:.2f})")
+
+        # --- Multi-robot tracker for dynamic obstacles (real only) ---
+        if not simulation:
+            tracker = MultiRobotTracker(cfg.ROBOT_IDS, cfg.LIMO_NUMBER,
+                                        cfg.MQTT_BROKER, cfg)
+            tracker.connect()
+            get_dynamic_obs = tracker.get_predicted_obstacles
+        else:
+            def get_dynamic_obs(_t):
+                return []
+
+        # Initial one-shot planning
+        a_star_init = AStarPlanner(wall_ox, wall_oy, cfg.GRID_SIZE, cfg.ROBOT_RADIUS)
+        rx, ry = a_star_init.planning(start_pose[0], start_pose[1],
+                                      goal[0], goal[1])
+        if rx is None:
+            print("✗ Initial A* plan failed.")
+            return
+        init_path = Path(rx[::-1], ry[::-1])
+
+        # Async replanner
+        def get_start_pose_for_planner():
+            if simulation:
+                return robot_sim.get_pose()
+            else:
+                pose, valid = get_robot_pose_mqtt(mqtt_self, cfg, None, 0.0)
+                return pose if valid else None
+
+        planner = AsyncPathPlanner(cfg,
+                                   wall_ox, wall_oy,
+                                   goal,
+                                   get_start_pose_for_planner,
+                                   get_dynamic_obs)
+        planner.start(initial_path=init_path)
+
+        # Visualization
+        plt.ion()
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.set_xlim(cfg.ARENA_X_MIN - 0.5, cfg.ARENA_X_MAX + 0.5)
+        ax.set_ylim(cfg.ARENA_Y_MIN - 0.5, cfg.ARENA_Y_MAX + 0.5)
+        ax.set_aspect('equal')
+        ax.set_title("Phase 1 – Single Robot with Real-Time Replanning")
+        ax.set_xlabel("X [m]")
+        ax.set_ylabel("Y [m]")
+        ax.grid(True)
+
+        ax.plot(wall_ox, wall_oy, 'ks', markersize=3, label='Walls')
+        ax.plot(goal[0], goal[1], 'gp', markersize=10, label='Goal')
+
+        robot_plot, = ax.plot([], [], 'ro', markersize=8, label='Robot')
+        traj_plot, = ax.plot([], [], 'r-', linewidth=1.5, label='Trajectory')
+        look_plot, = ax.plot([], [], 'cx', markersize=8, label='Lookahead')
+        ax.legend()
+
+        start_time = time.time()
+        prev_time = start_time
+        pose = start_pose.copy()
+        if simulation:
+            traj_x = robot_sim.trajectory_x
+            traj_y = robot_sim.trajectory_y
+        else:
+            traj_x = [pose[0]]
+            traj_y = [pose[1]]
+
+        print("\n[Phase 1] Starting control loop...")
+        while True:
+            now = time.time()
+            if now - start_time > cfg.MAX_TIME:
+                print("Max time reached.")
+                break
+            dt = now - prev_time
+            prev_time = now
+
+            if simulation:
+                pose = robot_sim.get_pose()
+            else:
+                pose, valid = get_robot_pose_mqtt(mqtt_self, cfg, pose, dt)
+                if not valid:
+                    if tcp:
+                        tcp.send_vel(0.0, 0.0)
+                    time.sleep(cfg.dt)
+                    continue
+
+            x, y, theta = pose
+            dist_to_goal = math.hypot(x - goal[0], y - goal[1])
+            if dist_to_goal < cfg.GOAL_POSITION_TOL:
+                print("✓ Reached goal.")
+                break
+
+            path = planner.get_path()
+            if path is None or len(path.x) < 2:
+                if tcp:
+                    tcp.send_vel(0.0, 0.0)
+                time.sleep(cfg.dt)
+                continue
+
+            # final approach vs pure pursuit
+            final_approach_radius = 0.40
+            if dist_to_goal < final_approach_radius:
+                v, w = go_to_goal_control(x, y, theta, goal, cfg)
+                lx, ly = goal[0], goal[1]
+            else:
+                v, w, (lx, ly) = pure_pursuit_control(pose, path, cfg)
+
+            if simulation:
+                robot_sim.update(v, w, cfg.dt)
+                traj_x = robot_sim.trajectory_x
+                traj_y = robot_sim.trajectory_y
+            else:
+                tcp.send_vel(v, w)
+                traj_x.append(x)
+                traj_y.append(y)
+
+            # visualization
+            robot_plot.set_data([x], [y])
+            traj_plot.set_data(traj_x, traj_y)
+            look_plot.set_data([lx], [ly])
+            plt.pause(0.001)
+
+            # enforce control rate
+            elapsed = time.time() - now
+            if elapsed < cfg.dt:
+                time.sleep(cfg.dt - elapsed)
+
+        if tcp:
+            tcp.send_vel(0.0, 0.0)
+
+    finally:
+        if tcp:
+            tcp.stop()
+        if mqtt_self:
+            mqtt_self.stop()
+        if tracker:
+            tracker.stop()
+        plt.ioff()
+        plt.show()
+        print("[Phase 1] Done.")
+
+
+# =============================================================================
+# PHASE 2: 12-ROBOT SIMULATOR WITH DIGITAL TWINS
+# =============================================================================
+
+class MultiRobotSimWorld:
+    """
+    World model for Phase 2 simulator.
+    Keeps track of robots and previous poses for velocity estimation.
+    """
+
+    def __init__(self, cfg: Config, robots, goals):
+        self.cfg = cfg
+        self.robots = robots
+        self.goals = goals
+        self.prev_poses = [r.get_pose() for r in robots]
+
+    def step(self, controls):
+        for r, (v, w) in zip(self.robots, controls):
+            r.update(v, w, self.cfg.dt)
+        self.prev_poses = [r.get_pose() for r in self.robots]
+
+    def get_pose(self, i):
+        return self.robots[i].get_pose()
+
+    def get_predicted_obstacles_for(self, robot_index, prediction_time):
+        """
+        For robot i, treat all other robots as dynamic obstacles.
+        Prediction: constant velocity extrapolated to 'prediction_time'.
+        Returns a list of (x, y, radius) keep-out disks.
+        """
+        obstacles = []
+        for j, r in enumerate(self.robots):
+            if j == robot_index:
+                continue
+            pose_now = r.get_pose()
+            pose_prev = self.prev_poses[j]
+            dt = self.cfg.dt if self.cfg.dt > 0 else 1e-3
+            vx = (pose_now[0] - pose_prev[0]) / dt
+            vy = (pose_now[1] - pose_prev[1]) / dt
+            x_pred = pose_now[0] + vx * prediction_time
+            y_pred = pose_now[1] + vy * prediction_time
+            vmag = math.hypot(vx, vy)
+            radius = (self.cfg.BASE_SAFETY_RADIUS +
+                      vmag * self.cfg.VELOCITY_SCALE_FACTOR)
+            obstacles.append((x_pred, y_pred, radius))
+        return obstacles
+
+
+def run_multi_robot_sim(num_robots=12):
+    """
+    Phase 2:
+        - Pure simulator with N robots (default 12)
+        - Each robot:
+            * random start pose
+            * random goal
+            * own AsyncPathPlanner (A*) using dynamic obstacles
+            * Pure Pursuit + final approach
+        - Color-coded robots, goals, and paths
+        - Deadlock handled by:
+            * priority-based yielding
+            * reverse + turn "escape" mode
+        - Goals themselves are NOT obstacles; only walls + robot bodies.
+    """
+    cfg = Config()
+    random.seed(1)
+    np.random.seed(1)
+
+    # Speed up simulation (not tied to real time)
+    cfg.V_DESIRED = 0.30
+    cfg.MAX_LINEAR_VEL = 0.30
+    cfg.CONTROL_RATE = 25
+    cfg.dt = 1.0 / cfg.CONTROL_RATE
+    cfg.REPLAN_INTERVAL = 0.5
+
+    static_ox, static_oy = create_wall_obstacles(cfg)
+
+    # Robots and goals
+    robots = []
+    goals = []
+    for _ in range(num_robots):
+        sx, sy, stheta = sample_random_pose(cfg)
+        robots.append(RobotSimulator(sx, sy, stheta, cfg))
+        while True:
+            g = sample_random_goal(cfg)
+            if math.hypot(g[0] - sx, g[1] - sy) > 0.8:
+                goals.append(g)
+                break
+    goals = np.array(goals)
+    world = MultiRobotSimWorld(cfg, robots, goals)
+
+    # Async planners
+    planners = []
+
+    def make_get_start_pose_fn(idx):
+        def fn():
+            return world.get_pose(idx)
+        return fn
+
+    def make_get_dyn_obs_fn(idx):
+        def fn(pred_time):
+            return world.get_predicted_obstacles_for(idx, pred_time)
+        return fn
+
+    for i in range(num_robots):
+        sx, sy, _ = world.get_pose(i)
+        gx, gy = goals[i]
+        a_star = AStarPlanner(static_ox, static_oy, cfg.GRID_SIZE, cfg.ROBOT_RADIUS)
+        rx, ry = a_star.planning(sx, sy, gx, gy)
+        if rx is None or len(rx) < 2:
+            rx = [sx, gx]
+            ry = [sy, gy]
+        init_path = Path(rx[::-1], ry[::-1])
+
+        planner = AsyncPathPlanner(
+            cfg,
+            static_ox, static_oy,
+            goals[i],
+            make_get_start_pose_fn(i),
+            make_get_dyn_obs_fn(i)
+        )
+        planner.start(initial_path=init_path)
+        planners.append(planner)
+
+    # DEADLOCK / STUCK STATE (per robot)
+    stuck_timer = [0.0 for _ in range(num_robots)]
+    prev_goal_dist = [float('inf') for _ in range(num_robots)]
+    escape_until = [0.0 for _ in range(num_robots)]
+    escape_turn_dir = [0 for _ in range(num_robots)]
+# PROXIMITY REVERSE STATE (per robot)
+    reverse_start_pos = [None for _ in range(num_robots)]  # position when reverse started
+    is_reversing = [False for _ in range(num_robots)]
+   
+    # Visualization
+    plt.ion()
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.set_xlim(cfg.ARENA_X_MIN - 0.5, cfg.ARENA_X_MAX + 0.5)
+    ax.set_ylim(cfg.ARENA_Y_MIN - 0.5, cfg.ARENA_Y_MAX + 0.5)
+    ax.set_aspect('equal')
+    ax.set_title("Phase 2 – 12-Robot Digital Twin Simulator (Deadlock-Resistant)")
+    ax.set_xlabel("X [m]")
+    ax.set_ylabel("Y [m]")
+    ax.grid(True)
+
+    ax.plot(static_ox, static_oy, 
+            'ks', markersize=3, label='Walls')
+
+    cmap = plt.cm.get_cmap('tab20', num_robots)
+    colors = cmap(np.arange(num_robots))
+
+    goals_scatter = ax.scatter(
+        goals[:, 0],
+        goals[:, 1],
+        c=colors,
+        marker='*',
+        s=120,
+        label='Goals'
+    )
+
+    robot_scatter = ax.scatter(
+        [r.x for r in robots],
+        [r.y for r in robots],
+        c=colors,
+        s=60,
+        label='Robots'
+    )
+
+    path_lines = []
+    for i in range(num_robots):
+        if i == 0:
+            line, = ax.plot([], [], '--', linewidth=1.8,
+                            color=colors[i], label='Planned Paths')
+        else:
+            line, = ax.plot([], [], '--', linewidth=1.2,
+                            color=colors[i])
+        path_lines.append(line)
+
+    ax.legend(
+        loc='upper right',
+        bbox_to_anchor=(1.02, 1.0),
+        borderaxespad=0.,
+        framealpha=0.9
+    )
+
+    start_time = time.time()
+    print("\n[Phase 2] Starting multi-robot simulation...")
+
+    collision_stop_radius = 2.0 * cfg.ROBOT_RADIUS + 0.1
+    step_count = 0
+
+    while True:
+        now = time.time()
+        sim_time = now - start_time
+        if sim_time > cfg.MAX_TIME:
+            print("Phase 2: Max time reached.")
+            break
+
+        poses = [r.get_pose() for r in robots]
+        controls = []
+        all_reached = True
+
+        # First pass: normal / escape control
+# First pass: normal / escape control
+        for i, pose in enumerate(poses):
+            x, y, theta = pose
+            gx, gy = goals[i]
+            dist_to_goal = math.hypot(x - gx, y - gy)
+
+            # Check proximity to other robots
+            min_dist_to_other = float('inf')
+            for j, other_pose in enumerate(poses):
+                if j == i:
+                    continue
+                d = math.hypot(x - other_pose[0], y - other_pose[1])
+                min_dist_to_other = min(min_dist_to_other, d)
+            
+            # PROXIMITY REVERSE: If another robot is too close, reverse 10cm
+            if min_dist_to_other < cfg.PROXIMITY_THRESHOLD:
+                if not is_reversing[i]:
+                    # Start reversing
+                    is_reversing[i] = True
+                    reverse_start_pos[i] = np.array([x, y])
+                    print(f"Robot {i}: Proximity trigger! Reversing 10cm (dist={min_dist_to_other:.2f}m)")
+                
+                # Continue reversing until we've moved 10cm back
+                if reverse_start_pos[i] is not None:
+                    dist_reversed = math.hypot(x - reverse_start_pos[i][0], 
+                                              y - reverse_start_pos[i][1])
+                    if dist_reversed < cfg.PROXIMITY_REVERSE_DISTANCE:
+                        # Still need to reverse more
+                        v = -cfg.PROXIMITY_REVERSE_SPEED
+                        w = 0.0  # reverse straight back
+                        controls.append((v, w))
+                        all_reached = False
+                        continue
+                    else:
+                        # Finished reversing 10cm
+                        is_reversing[i] = False
+                        reverse_start_pos[i] = None
+                        stuck_timer[i] = 0.0  # reset stuck timer
+            else:
+                # Far enough away, cancel any active reverse
+                is_reversing[i] = False
+                reverse_start_pos[i] = None
+
+            # progress tracking
+            if prev_goal_dist[i] - dist_to_goal > 0.01:
+                prev_goal_dist[i] = dist_to_goal
+                stuck_timer[i] = 0.0
+            else:
+                stuck_timer[i] += cfg.dt
+
+            # currently in escape mode?
+            if sim_time < escape_until[i]:
+                v = -cfg.ESCAPE_REVERSE_SPEED
+                w = escape_turn_dir[i] * cfg.ESCAPE_TURN_RATE
+                controls.append((v, w))
+                all_reached = False
+                continue
+
+            # trigger escape if stuck too long
+            if stuck_timer[i] > cfg.STUCK_TIME_THRESHOLD:
+                escape_until[i] = sim_time + cfg.ESCAPE_DURATION
+                escape_turn_dir[i] = random.choice([-1, 1])
+                stuck_timer[i] = 0.0
+                v = -cfg.ESCAPE_REVERSE_SPEED
+                w = escape_turn_dir[i] * cfg.ESCAPE_TURN_RATE
+                controls.append((v, w))
+                all_reached = False
+                continue
+
+            # goal check
+            if dist_to_goal < cfg.GOAL_POSITION_TOL:
+                controls.append((0.0, 0.0))
+                continue
+
+            all_reached = False
+
+            final_approach_radius = 0.40
+            if dist_to_goal < final_approach_radius:
+                v, w = go_to_goal_control(x, y, theta, goals[i], cfg)
+            else:
+                path = planners[i].get_path()
+                if path is None or len(path.x) < 2:
+                    v, w = 0.0, 0.0
+                else:
+                    v, w, _ = pure_pursuit_control(pose, path, cfg)
+
+            controls.append((v, w))
+
+        # Second pass: local collision handling
+        for i in range(num_robots):
+            xi, yi, _ = poses[i]
+            for j in range(i + 1, num_robots):
+                xj, yj, _ = poses[j]
+                d = math.hypot(xi - xj, yi - yj)
+                if d < collision_stop_radius:
+                    # priority: lower index keeps going; higher index "loses"
+                    loser = j
+                    escape_until[loser] = sim_time + cfg.ESCAPE_DURATION
+                    escape_turn_dir[loser] = random.choice([-1, 1])
+                    controls[loser] = (-cfg.ESCAPE_REVERSE_SPEED,
+                                       escape_turn_dir[loser] * cfg.ESCAPE_TURN_RATE)
+
+        if all_reached:
+            print("✓ All robots reached their goals (within tolerance).")
+            break
+
+        world.step(controls)
+
+        # Visualization (throttled)
+        if step_count % 3 == 0:
+            robot_scatter.set_offsets(
+                np.array([[r.x, r.y] for r in robots])
+            )
+            for i in range(num_robots):
+                path = planners[i].get_path()
+                if path is not None and len(path.x) > 1:
+                    path_lines[i].set_data(path.x, path.y)
+                else:
+                    path_lines[i].set_data([], [])
+            plt.pause(0.001)
+
+        step_count += 1
+
+    for p in planners:
+        p.stop()
+
+    plt.ioff()
+    plt.show()
+    print("[Phase 2] Simulation complete.")
+
+
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
+
+if __name__ == '__main__':
+    print("\nME416 – LIMO Multi-Robot Planner (Lab 3)")
+    print("=========================================\n")
+    print("Select mode:")
+    print("  1) Phase 1 – Single robot (simulation)")
+    print("  2) Phase 1 – Single robot (real robot + MoCap)")
+    print("  3) Phase 2 – 12-robot digital twin simulator")
+    choice = input("Enter choice [3]: ").strip() or "3"
+
+    if choice == "1":
+        run_phase1_single_robot(simulation=True)
+    elif choice == "2":
+        run_phase1_single_robot(simulation=False)
+    else:
+        run_multi_robot_sim(num_robots=12)
