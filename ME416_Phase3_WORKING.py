@@ -39,13 +39,13 @@ class Config:
     """Configuration parameters"""
 
     # --- Arena ---
-    ARENA_X_MIN = 0.0
-    ARENA_X_MAX = 9.0
-    ARENA_Y_MIN = 0.0
-    ARENA_Y_MAX = 5.0
+    ARENA_X_MIN = -4.5
+    ARENA_X_MAX =  3.5
+    ARENA_Y_MIN = -2.5
+    ARENA_Y_MAX =  2.5
 
     ROBOT_RADIUS = 0.4
-    GOAL_TOLERANCE = 0.4
+    GOAL_TOLERANCE = 0.2
 
     # Radius around each robot that we want to treat as "occupied"
     # for planning & emergency avoidance
@@ -62,15 +62,15 @@ class Config:
     
     # Planning strategy for crowded scenarios
     USE_DYNAMIC_OBSTACLES_IN_PLANNING = True  # Can disable if too crowded
-    MIN_OBSTACLE_DISTANCE_FOR_PLANNING = 1.5  # Only avoid robots within this distance during planning
+    MIN_OBSTACLE_DISTANCE_FOR_PLANNING = 1.0  # Only avoid robots within this distance during planning
     
     # List of ALL robot numbers in the arena (UPDATE THIS!)
     # ALL 10 ROBOTS in the demo arena
-    ALL_ROBOT_NUMBERS = ['815', '809', '808', '804', '799', '793', '790', '785', '780','777', '774', '155']
+    ALL_ROBOT_NUMBERS = ['809', '808', '785', '777', '774', '155', '793', '780', '814']
     
     # --- LIMO / Network Configuration ---
-    LIMO_NUMBER = '809'          # THIS robot's number (CHANGE FOR EACH ROBOT!)
-    LIMO_IP_LAST_3 = '172'       # last octet of LIMO IP (CHANGE FOR EACH ROBOT!)
+    LIMO_NUMBER = '777'          # THIS robot's number (CHANGE FOR EACH ROBOT!)
+    LIMO_IP_LAST_3 = '101'       # last octet of LIMO IP (CHANGE FOR EACH ROBOT!)
     LIMO_IP_PREFIX = '192.168.1.'
     LIMO_PORT = 12345
     MQTT_BROKER = 'rasticvm.lan'
