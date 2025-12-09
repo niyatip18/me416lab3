@@ -66,7 +66,7 @@ class Config:
     
     # List of ALL robot numbers in the arena (UPDATE THIS!)
     # ALL 10 ROBOTS in the demo arena
-    ALL_ROBOT_NUMBERS = ['809', '808', '785', '777', '774', '155', '793', '780', '814']
+    ALL_ROBOT_NUMBERS = ['809', '808', '785', '777', '774', '155', '793', '780', '815', '799','804', '790']
     
     # --- LIMO / Network Configuration ---
     LIMO_NUMBER = '777'          # THIS robot's number (CHANGE FOR EACH ROBOT!)
